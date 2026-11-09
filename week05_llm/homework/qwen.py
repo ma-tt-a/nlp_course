@@ -21,7 +21,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
-        raise NotImplementedError("TODO: implement RMSNorm.forward")
+        dtype = x.dtype
+        x = x.float()
+        x = x / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x = x * (1 + self.weight)
+        return x.to(dtype)
 
 
 class RMSNormGated(nn.Module):
@@ -33,7 +37,13 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x, gate):
-        raise NotImplementedError("TODO: implement RMSNormGated.forward")
+        dtype = x.dtype
+        x = x.float()
+        x = x / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x = x.to(dtype)
+        x = self.weight * x * F.silu(gate.float())
+        x = x.to(dtype)
+        return x
 
 
 # ============================================================================
@@ -44,7 +54,8 @@ def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     # split x in half along the last dim: x1, x2
     # return cat(-x2, x1) along the last dim
-    raise NotImplementedError("TODO: implement rotate_half")
+    x1, x2 = torch.chunk(x, chunks=2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
 
 
 class Qwen35RotaryEmbedding(nn.Module):
@@ -65,7 +76,12 @@ class Qwen35RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.LongTensor):
-        raise NotImplementedError("TODO: implement Qwen35RotaryEmbedding.forward")
+        dtype, device = hidden_states.dtype, hidden_states.device
+        freqs = torch.einsum("ij, k -> ijk", position_ids, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = torch.cos(emb).to(dtype).to(device)
+        sin = torch.sin(emb).to(dtype).to(device)
+        return cos, sin
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -73,7 +89,11 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     # only the first rotary_dim channels of q/k get rotated; the rest pass through unchanged
     # rotated = x * cos + rotate_half(x) * sin, applied to that leading slice, then re-concatenated
     # cos/sin need a head dim inserted to broadcast against q/k's (b, heads, s, dim) shape
-    raise NotImplementedError("TODO: implement apply_rotary_pos_emb")
+    rotate = lambda x_rot: x_rot * cos[:, None, ...] + rotate_half(x_rot) * sin[:, None, ...]
+    rotary_dim = cos.shape[-1]
+    q_rot = torch.cat([rotate(q[..., :rotary_dim]), q[..., rotary_dim:]], dim=-1)
+    k_rot = torch.cat([rotate(k[..., :rotary_dim]), k[..., rotary_dim:]], dim=-1)
+    return q_rot, k_rot
 
 
 # ============================================================================
@@ -175,9 +195,14 @@ class GatedAttention(nn.Module):
             return self.forward_gqa(hidden_states, position_embeddings, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
+        dtype, device = hidden_states.dtype, hidden_states.device
         query_states, key_states, value_states, gate = self._project_qkv_and_gate(hidden_states, position_embeddings)
-
-        raise NotImplementedError("TODO: implement regular multi-head GatedAttention.forward")
+        mask = build_causal_mask(seq_len, dtype, device) if attention_mask is None else attention_mask
+        scores = query_states @ key_states.transpose(-2, -1) / self.head_dim ** 0.5 + mask
+        attn = F.softmax(scores, dim=-1) @ value_states
+        attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.head_dim * self.num_attention_heads)
+        out = self.o_proj(attn * F.sigmoid(gate))
+        return out
 
     def forward_gqa(self, hidden_states, position_embeddings, attention_mask=None):
         """Bonus TODO: grouped-query attention for fewer KV heads than Q heads.
@@ -191,8 +216,18 @@ class GatedAttention(nn.Module):
         GQA and many more efficiency techniques will be explained in the
         week07_efficiency lecture.
         """
-        raise NotImplementedError("TODO (bonus): implement GatedAttention.forward_gqa")
-
+        batch_size, seq_len, _ = hidden_states.shape
+        dtype, device = hidden_states.dtype, hidden_states.device
+        query_states, key_states, value_states, gate = self._project_qkv_and_gate(hidden_states, position_embeddings)
+        mask = build_causal_mask(seq_len, dtype, device) if attention_mask is None else attention_mask
+        num_repeat = self.num_key_value_groups
+        k = key_states.repeat_interleave(num_repeat, dim=1)
+        v = value_states.repeat_interleave(num_repeat, dim=1)
+        scores = query_states @ k.transpose(-2, -1) / self.head_dim ** 0.5 + mask
+        attn = F.softmax(scores, dim=-1) @ v
+        attn = attn.transpose(1, 2).reshape(batch_size, seq_len, self.head_dim * self.num_attention_heads)
+        out = self.o_proj(attn * F.sigmoid(gate))
+        return out
 
 @torch.no_grad()
 def naive_looped_gated_attention(attn: GatedAttention, hidden_states, position_embeddings, attention_mask=None):
@@ -239,7 +274,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        raise NotImplementedError("TODO: implement MLP.forward")
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ============================================================================
@@ -339,7 +374,21 @@ class GatedDeltaNet(nn.Module):
         See homework.ipynb for the equations and dtype requirements.
         """
         batch_size, seq_len, _ = hidden_states.shape
-        raise NotImplementedError("TODO: implement GatedDeltaNet.forward")
+        proj_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        proj_qkv = F.silu(self.conv1d(proj_qkv)[..., :seq_len]).transpose(1, 2)
+        q, k, v = proj_qkv.split(split_size=[self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        k = k.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        v = v.view(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        num_repeat = self.num_v_heads // self.num_k_heads
+        q = q.repeat_interleave(num_repeat, dim=2)
+        k = k.repeat_interleave(num_repeat, dim=2)
+        beta = F.sigmoid(self.in_proj_b(hidden_states))
+        g = -torch.exp(self.A_log.float()) * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias)
+        core_out = gated_delta_rule_recurrent(q, k, v, g, beta)
+        z = self.in_proj_z(hidden_states).view(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        out = self.out_proj(self.norm(core_out, z).view(batch_size, seq_len, -1))
+        return out
 
 
 # ============================================================================
@@ -366,7 +415,14 @@ class Qwen35DecoderLayer(nn.Module):
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None):
         """Applies the two pre-LN residual connections; see homework.ipynb for the formula."""
-        raise NotImplementedError("TODO: implement Qwen35DecoderLayer.forward")
+        h = self.input_layernorm(hidden_states)
+        if self.block_type == "full_attention":
+            h = hidden_states + self.self_attn(h, position_embeddings, attention_mask)
+        else:
+            h = hidden_states + self.linear_attn(h)
+        out = self.post_attention_layernorm(h)
+        return h + self.mlp(out)
+        
 
 
 class Qwen35Model(nn.Module):
@@ -385,7 +441,15 @@ class Qwen35Model(nn.Module):
         input_ids: (batch, seq_len) int64
         Returns last_hidden_state: (batch, seq_len, hidden_size)
         """
-        raise NotImplementedError("TODO: implement Qwen35Model.forward")
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        embs = self.embed_tokens(input_ids)
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        for layer in self.layers:
+            pos_embs = self.rotary_emb(embs, position_ids)
+            embs = layer(embs, pos_embs)
+        return self.norm(embs)
+        
 
 
 class Qwen35ForCausalLM(nn.Module):
@@ -408,7 +472,14 @@ class Qwen35ForCausalLM(nn.Module):
         `embed_tokens.weight` when tied -- so this works unchanged for both
         tied and untied checkpoints.
         """
-        raise NotImplementedError("TODO: implement Qwen35ForCausalLM.forward")
+        batch_size, seq_len = input_ids.shape
+        if labels is None:
+            logits = self.lm_head(self.model(input_ids))
+            loss = None
+        else:
+            logits = self.lm_head(self.model(input_ids))
+            loss = F.cross_entropy(logits.reshape(batch_size * seq_len, -1), labels.reshape(batch_size * seq_len))
+        return logits, loss
 
 
 # ============================================================================
@@ -429,7 +500,37 @@ def qwen35_config_from_hf(config: dict) -> Qwen35Config:
     # rope fields (rope_theta, partial_rotary_factor) live under a nested rope_scaling/rope_parameters dict
     # watch for tie_word_embeddings living at the top level, not under text_config
     # build and return Qwen35Config(**mapped_fields)
-    raise NotImplementedError("TODO: implement qwen35_config_from_hf")
+    if "text_config" in config:
+        text_config = config["text_config"]
+        mapped_fields = {
+            "vocab_size": text_config["vocab_size"],
+            "hidden_size": text_config["hidden_size"],
+            "intermediate_size": text_config["intermediate_size"],
+            "num_hidden_layers": text_config["num_hidden_layers"],
+            "num_attention_heads": text_config["num_attention_heads"],
+            "num_key_value_heads": text_config["num_key_value_heads"],
+            "head_dim": text_config["head_dim"],
+            "attention_bias": text_config["attention_bias"],
+            "linear_conv_kernel_dim": text_config["linear_conv_kernel_dim"],
+            "linear_key_head_dim": text_config["linear_key_head_dim"],
+            "linear_value_head_dim": text_config["linear_value_head_dim"],
+            "linear_num_key_heads":text_config["linear_num_key_heads"],
+            "linear_num_value_heads":text_config["linear_num_value_heads"],
+            "rope_theta": text_config["rope_parameters"]["rope_theta"],
+            "partial_rotary_factor": text_config["rope_parameters"]["partial_rotary_factor"],
+            "max_position_embeddings": text_config["max_position_embeddings"],
+            "rms_norm_eps": text_config["rms_norm_eps"],
+            "hidden_act": text_config["hidden_act"],
+            "tie_word_embeddings": text_config["tie_word_embeddings"] if "tie_word_embeddings" in text_config else config["tie_word_embeddings"],
+            "full_attention_interval": text_config["full_attention_interval"],
+            "mtp_num_layers":  text_config["mtp_num_hidden_layers"],
+        }
+        return Qwen35Config(**mapped_fields)
+    config["mtp_num_layers"] = config["mtp_num_hidden_layers"]
+    config["rope_theta"] = config["rope_parameters"]["rope_theta"]
+    config["partial_rotary_factor"] = config["rope_parameters"]["partial_rotary_factor"]
+    del config["mtp_num_hidden_layers"], config["rope_parameters"]
+    return Qwen35Config(**config)
 
 
 # ============================================================================
