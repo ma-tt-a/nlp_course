@@ -445,8 +445,9 @@ class Qwen35Model(nn.Module):
         device = input_ids.device
         embs = self.embed_tokens(input_ids)
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        pos_embs = self.rotary_emb(embs, position_ids)
         for layer in self.layers:
-            pos_embs = self.rotary_emb(embs, position_ids)
+            # pos_embs = self.rotary_emb(embs, position_ids)
             embs = layer(embs, pos_embs)
         return self.norm(embs)
         
@@ -587,4 +588,19 @@ class Qwen35MTPHead(nn.Module):
         embedding classifier, including when the main LM head is untied.
         See homework.ipynb for the recipe.
         """
-        raise NotImplementedError("TODO (bonus): implement Qwen35MTPHead.forward")
+        batch_size, seq_len = input_ids.shape
+        if seq_len < 3:
+            raise ValueError('There is no prediction targets')
+        dtype, device = hidden_states.dtype, hidden_states.device
+        hs_norm = self.pre_fc_norm_hidden(hidden_states[:, :-2])
+        emb_norm = self.pre_fc_norm_embedding(embed_tokens(input_ids[:, 1:-1]))
+        embs = self.fc(torch.cat([hs_norm, emb_norm], dim=-1))
+        mask = build_causal_mask(seq_len - 2, dtype=dtype, device=device)
+        position_ids = torch.arange(seq_len - 2, device=device).unsqueeze(0).expand(batch_size, -1)
+        pos_embs = self.rotary_emb(hidden_states, position_ids)
+        for layer in self.layers:
+            embs = layer(embs, pos_embs, attention_mask=mask)
+        embs = self.norm(embs)
+        logits = embs @ embed_tokens.weight.T
+        return logits
+
